@@ -1,6 +1,10 @@
+import contextlib
+import io
+import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import mailtriage as mt
 
@@ -120,6 +124,126 @@ class CliTests(unittest.TestCase):
                 fh.write("hello world without headers")
             self.assertEqual(mt.main([junk]), 2)
             self.assertEqual(mt.main([os.path.join(d, "nope")]), 2)
+
+
+class SuffixTests(unittest.TestCase):
+    def test_org_domain_handles_two_level_suffixes(self):
+        self.assertEqual(mt.org_domain("mail.example.co.uk"), "example.co.uk")
+        self.assertEqual(mt.org_domain("example.co.uk"), "example.co.uk")
+        self.assertEqual(mt.org_domain("news.example.com.tr"), "example.com.tr")
+        self.assertEqual(mt.org_domain("a.b.example.com"), "example.com")
+        self.assertEqual(mt.org_domain("example.com"), "example.com")
+        self.assertEqual(mt.org_domain("localhost"), "localhost")
+
+    def test_two_organisations_under_the_same_suffix_are_different(self):
+        raw = variant("Return-Path: <news@example.com>", "Return-Path: <x@attacker.co.uk>").replace(
+            "From: Example News <news@example.com>", "From: Example News <news@victim.co.uk>")
+        self.assertIn(("LOW", "return-path-mismatch"), rules(raw))
+
+    def test_same_organisation_under_co_uk_is_aligned(self):
+        raw = variant("Return-Path: <news@example.com>", "Return-Path: <b@bounce.example.co.uk>").replace(
+            "From: Example News <news@example.com>", "From: Example News <news@mail.example.co.uk>")
+        self.assertNotIn("return-path-mismatch", {r for _, r in rules(raw)})
+
+
+class LookalikeTests(unittest.TestCase):
+    def test_typos_and_confusables(self):
+        for dom in ("paypa1.com", "paypall.com", "rnicrosoft.com", "arnazon.com", "gooogle.com", "mail.paypa1.com"):
+            self.assertIsNotNone(mt.lookalike_of(dom), dom)
+
+    def test_real_domains_and_unrelated_domains_are_fine(self):
+        for dom in ("paypal.com", "mail.google.com", "example.com", "mycompany.io", "paypal.com.evil.example"):
+            self.assertIsNone(mt.lookalike_of(dom), dom)
+
+    def test_short_domains_are_skipped(self):
+        self.assertIsNone(mt.lookalike_of("x.us"))
+
+    def test_rule_fires_in_analysis(self):
+        raw = GOOD.replace("example.com", "paypa1.com")
+        self.assertIn(("MEDIUM", "lookalike-domain"), rules(raw))
+
+    def test_clean_message_has_no_lookalike(self):
+        self.assertNotIn("lookalike-domain", {r for _, r in rules(GOOD)})
+
+    def test_idna_display(self):
+        self.assertEqual(mt.decode_idna("xn--e1afmkfd.xn--p1ai"), "пример.рф")
+        self.assertEqual(mt.decode_idna("plain.example"), "plain.example")
+        self.assertEqual(mt.decode_idna("xn--!!!"), "xn--!!!")
+
+    def test_punycode_finding_shows_unicode_form(self):
+        raw = GOOD.replace("news@example.com", "news@xn--e1afmkfd.xn--p1ai")
+        found = [f for f in mt.analyze(raw)["findings"] if f[1] == "punycode-domain"]
+        self.assertIn("пример.рф", found[0][2])
+
+
+class SpfAlignmentTests(unittest.TestCase):
+    def test_spf_pass_for_other_domain(self):
+        raw = variant("spf=pass smtp.mailfrom=example.com", "spf=pass smtp.mailfrom=bounce.sender.example")
+        self.assertIn(("LOW", "spf-misaligned"), rules(raw))
+
+    def test_aligned_spf_is_fine(self):
+        self.assertNotIn("spf-misaligned", {r for _, r in rules(GOOD)})
+
+    def test_subdomain_alignment_is_fine(self):
+        raw = variant("smtp.mailfrom=example.com", "smtp.mailfrom=bounces.example.com")
+        self.assertNotIn("spf-misaligned", {r for _, r in rules(raw)})
+
+
+def run_main(*argv, stdin=""):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch("sys.stdin", io.StringIO(stdin)):
+        code = mt.main(list(argv))
+    return code, out.getvalue(), err.getvalue()
+
+
+class CliTests(unittest.TestCase):
+    BAD = GOOD.replace("spf=pass", "spf=fail").replace("dmarc=pass", "dmarc=fail")
+
+    def test_json_single_message(self):
+        code, out, _ = run_main("--json", stdin=self.BAD)
+        data = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertEqual(data["auth"]["spf"], "fail")
+        self.assertEqual(data["hops"][0]["ip"], "203.0.113.10")
+        self.assertIn("T", data["hops"][0]["date"])  # ISO timestamps
+        self.assertIn("spf-fail", {f["rule"] for f in data["findings"]})
+        self.assertTrue(data["verdict"].startswith("HIGH RISK"))
+        self.assertNotIn("raw", data["auth"])
+
+    def test_json_clean(self):
+        code, out, _ = run_main("--json", stdin=GOOD)
+        self.assertEqual((code, json.loads(out)["findings"]), (0, []))
+
+    def test_several_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, b = os.path.join(d, "a.eml"), os.path.join(d, "b.eml")
+            for path, text in ((a, GOOD), (b, self.BAD)):
+                with open(path, "w") as fh:
+                    fh.write(text)
+            code, out, _ = run_main(a, b, "--json")
+            data = json.loads(out)
+            self.assertEqual((code, len(data)), (1, 2))
+            self.assertEqual([d_["file"] for d_ in data], [a, b])
+            code, out, _ = run_main(a, b)
+            self.assertIn("######## " + a, out)
+            self.assertEqual(run_main(a)[0], 0)
+
+    def test_one_bad_input_stops_with_exit_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.eml")
+            with open(a, "w") as fh:
+                fh.write(GOOD)
+            self.assertEqual(run_main(a, os.path.join(d, "missing.eml"))[0], 2)
+
+    def test_not_headers(self):
+        code, _, err = run_main(stdin="just some prose without headers")
+        self.assertEqual(code, 2)
+        self.assertIn("does not look like", err)
+
+    def test_text_output_unchanged_for_single_input(self):
+        _, out, _ = run_main(stdin=GOOD)
+        self.assertTrue(out.startswith("== Message =="))
+        self.assertNotIn("########", out)
 
 
 if __name__ == "__main__":

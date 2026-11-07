@@ -9,14 +9,70 @@ Exit code 0 = no red flags, 1 = findings at MEDIUM or above, 2 = unreadable inpu
 """
 import argparse
 import email.utils
+import json
 import re
 import sys
 from email.parser import HeaderParser
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 SEV = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
 EMAIL_IN_TEXT = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 IP = re.compile(r"\[(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]{3,})\]")
+
+
+# Registries that sell names at the third level, so "example.co.uk" is the organisational domain.
+TWO_LEVEL_SUFFIXES = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au", "co.nz", "org.nz", "net.nz",
+    "co.jp", "or.jp", "ne.jp", "ac.jp", "co.kr", "or.kr", "co.in", "net.in", "org.in", "ac.in",
+    "com.br", "net.br", "org.br", "com.ar", "com.mx", "com.co", "com.pe", "com.ve", "com.uy",
+    "com.tr", "net.tr", "org.tr", "gen.tr", "web.tr", "av.tr", "k12.tr", "edu.tr", "gov.tr",
+    "com.cn", "net.cn", "org.cn", "com.hk", "com.tw", "com.sg", "com.my", "com.ph", "com.vn", "co.id", "co.th",
+    "co.za", "org.za", "co.il", "com.sa", "com.eg", "com.ng", "co.ke", "com.pk", "com.bd", "com.ua", "com.pl", "com.ru",
+}
+POPULAR_DOMAINS = (
+    "google.com gmail.com microsoft.com outlook.com office.com live.com apple.com icloud.com amazon.com paypal.com "
+    "netflix.com facebook.com instagram.com linkedin.com twitter.com dropbox.com docusign.com dhl.com fedex.com "
+    "ups.com usps.com chase.com wellsfargo.com bankofamerica.com citibank.com hsbc.com binance.com coinbase.com "
+    "github.com adobe.com spotify.com whatsapp.com telegram.org yahoo.com ebay.com walmart.com stripe.com slack.com "
+    "intuit.com zoom.us steampowered.com discord.com roblox.com booking.com airbnb.com uber.com"
+).split()
+CONFUSABLE = (("rn", "m"), ("vv", "w"), ("0", "o"), ("1", "l"), ("5", "s"))
+
+
+def edit_distance(a, b):
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def skeleton(domain):
+    for a, b in CONFUSABLE:
+        domain = domain.replace(a, b)
+    return domain
+
+
+def lookalike_of(domain):
+    """The popular domain that ``domain`` imitates (one typo or a look-alike character swap), else None."""
+    org = org_domain(domain)
+    if org in POPULAR_DOMAINS or len(org) < 8:
+        return None
+    for pop in POPULAR_DOMAINS:
+        if abs(len(pop) - len(org)) <= 1 and (edit_distance(org, pop) == 1 or skeleton(org) == skeleton(pop)):
+            return pop
+    return None
+
+
+def decode_idna(domain):
+    """Unicode form of a punycode domain (for display), or the input when it cannot be decoded."""
+    try:
+        return domain.encode("ascii").decode("idna")
+    except (UnicodeError, ValueError):
+        return domain
 
 
 def domain_of(address):
@@ -25,8 +81,10 @@ def domain_of(address):
 
 
 def org_domain(domain):
-    """Rough organisational domain: last two labels (good enough for alignment hints)."""
+    """Rough organisational domain: last two labels, three for common suffixes such as co.uk."""
     labels = domain.split(".")
+    if len(labels) >= 3 and ".".join(labels[-2:]) in TWO_LEVEL_SUFFIXES:
+        return ".".join(labels[-3:])
     return ".".join(labels[-2:]) if len(labels) >= 2 else domain
 
 
@@ -96,7 +154,12 @@ def analyze(raw):
         add("HIGH", "display-name-spoof", "display name shows %s but the real sender is %s" % (shown[0], addr),
             "do not trust the display name; verify the real address")
     if from_dom.startswith("xn--") or ".xn--" in from_dom:
-        add("MEDIUM", "punycode-domain", "sender domain %s uses punycode (possible look-alike characters)" % from_dom)
+        add("MEDIUM", "punycode-domain", "sender domain %s uses punycode and displays as %s (possible look-alike characters)" % (
+            from_dom, decode_idna(from_dom)))
+    imitated = lookalike_of(from_dom) if from_dom else None
+    if imitated:
+        add("MEDIUM", "lookalike-domain", "sender domain %s looks like %s (one typo or look-alike character away)" % (
+            from_dom, imitated), "check the real domain before clicking or replying")
     if reply_dom and from_dom and org_domain(reply_dom) != org_domain(from_dom):
         add("MEDIUM", "reply-to-mismatch", "Reply-To domain (%s) differs from From domain (%s)" % (reply_dom, from_dom),
             "replies would go to a different organisation")
@@ -119,6 +182,9 @@ def analyze(raw):
             add("MEDIUM", "spf-softfail", "SPF softfail: the sending server is probably not authorised")
         elif spf in (None, "none", "neutral"):
             add("LOW", "spf-missing", "no meaningful SPF result (%s)" % (spf or "absent"))
+        elif spf == "pass" and auth["spf_domain"] and from_dom and org_domain(auth["spf_domain"]) != org_domain(from_dom):
+            add("LOW", "spf-misaligned", "SPF passed for %s, not the From domain %s (DMARC would not count it)" % (
+                auth["spf_domain"], from_dom))
         if "fail" in auth["dkim"] or "permerror" in auth["dkim"]:
             add("HIGH", "dkim-fail", "DKIM signature failed verification: the message may have been altered or forged")
         elif not auth["dkim"] or all(r in ("none", "neutral") for r in auth["dkim"]):
@@ -166,27 +232,47 @@ def render(result):
     return "\n".join(out)
 
 
+def to_jsonable(result):
+    out = {"summary": {k: (" ".join(str(v).split()) if v else None) for k, v in result["summary"].items()},
+           "auth": {k: v for k, v in result["auth"].items() if k != "raw"},
+           "hops": [dict(h, date=h["date"].isoformat() if h["date"] else None) for h in result["hops"]],
+           "findings": [{"severity": sv, "rule": r, "message": m, "note": f} for sv, r, m, f in result["findings"]],
+           "verdict": result["verdict"]}
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Triage e-mail headers offline.")
-    ap.add_argument("file", nargs="?", default="-", help="file with raw headers or a full message (default: stdin)")
+    ap.add_argument("files", nargs="*", default=["-"], help="files with raw headers or full messages (default: stdin)")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args(argv)
-    try:
-        if args.file == "-":
-            raw = sys.stdin.read()
-        else:
-            with open(args.file, errors="replace") as fh:
-                raw = fh.read()
-    except OSError as exc:
-        print("mailtriage: %s" % exc, file=sys.stderr)
-        return 2
-    if ":" not in raw.split("\n\n", 1)[0]:
-        print("mailtriage: input does not look like e-mail headers", file=sys.stderr)
-        return 2
-    result = analyze(raw)
-    print(render(result))
-    return 1 if any(f[0] in ("HIGH", "MEDIUM") for f in result["findings"]) else 0
-
+    results, bad, code = [], False, 0
+    for name in args.files:
+        try:
+            if name == "-":
+                raw = sys.stdin.read()
+            else:
+                with open(name, errors="replace") as fh:
+                    raw = fh.read()
+        except OSError as exc:
+            print("mailtriage: %s" % exc, file=sys.stderr)
+            return 2
+        if ":" not in raw.split("\n\n", 1)[0]:
+            print("mailtriage: %s does not look like e-mail headers" % ("input" if name == "-" else name), file=sys.stderr)
+            return 2
+        result = analyze(raw)
+        results.append((name, result))
+        bad = bad or any(f[0] in ("HIGH", "MEDIUM") for f in result["findings"])
+    if args.json:
+        data = [dict(to_jsonable(r), file=n) for n, r in results]
+        print(json.dumps(data if len(data) > 1 else data[0], indent=2))
+    else:
+        for n, r in results:
+            if len(results) > 1:
+                print("######## %s" % ("stdin" if n == "-" else n))
+            print(render(r))
+    return 1 if bad else code
 
 if __name__ == "__main__":
     sys.exit(main())
