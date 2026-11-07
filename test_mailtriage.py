@@ -196,7 +196,7 @@ def run_main(*argv, stdin=""):
     return code, out.getvalue(), err.getvalue()
 
 
-class CliTests(unittest.TestCase):
+class NewCliTests(unittest.TestCase):
     BAD = GOOD.replace("spf=pass", "spf=fail").replace("dmarc=pass", "dmarc=fail")
 
     def test_json_single_message(self):
